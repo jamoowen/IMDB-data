@@ -12,6 +12,10 @@ df_imdb_crew = spark.read.csv(S3_PATH+'/JO/title.crew.tsv.gz', header=True, sep=
 df_imdb_rating = spark.read.csv(S3_PATH+'/JO/title.ratings.tsv.gz', header=True, sep='\t', nullValue='\\N')
 df_imdb_principals = spark.read.csv(S3_PATH+'/JO/title.principals.tsv.gz', header=True, sep='\t', nullValue='\\N')
 
+# ----------------------------------------------------------------------------------------------------------------------------
+# Principals (crew)
+# ----------------------------------------------------------------------------------------------------------------------------
+
 # principals = crew members (actor, dir, cameraman etc) for a given title(tconst)
 # join with movies to get moviename and join with name dataset for crew names
 df_principals_extended = df_imdb_principals.filter("category like 'act%' or category like 'dir%'") \
@@ -22,21 +26,51 @@ df_principals_extended = df_imdb_principals.filter("category like 'act%' or cate
 df_principals_extended.write.mode('overwrite').parquet(S3_PATH+'/JO/principals_extended.parquet')
 df_principals_extended = spark.read.parquet(S3_PATH+'/JO/principals_extended.parquet')
 
+# ----------------------------------------------------------------------------------------------------------------------------
+# ACTORS
+# ----------------------------------------------------------------------------------------------------------------------------
+
+# matches actors with the movies associated with them - used for clicking on an actors name
+df_actors_with_movies= df_principals_extended.filter("category like 'act%'").drop('knownforTitles') \
+  .select("nconst", "tconst", "primaryName", "birthYear", "primaryTitle", "characters", "startYear", "runtimeMinutes", "genres") \
+  .filter("primaryName is not null and birthYear is not null and primaryTitle is not null and characters is not null") \
+  .orderBy('primaryName')
+
+df_actors_with_movies.write.mode('overwrite').parquet(S3_PATH+'/JO/actors_with_movies.parquet')
+df_actors_with_movies = spark.read.parquet(S3_PATH+'/JO/actors_with_movies.parquet')
+
 # list of distinct actors with the movies they have appeared in
 df_actors_distinct = df_principals_extended.filter("category like 'act%'") \
-  .groupBy(["nconst", "primaryName", "birthYear"]).agg(psf.collect_set('primaryTitle').alias('knownFor'), psf.collect_set('tconst').alias('titlesTconst')) \
+  .groupBy(["nconst", "primaryName", "birthYear"]).agg(psf.collect_set('primaryTitle').alias('knownFor'), psf.collect_set('tconst').alias('titlesTconst')).filter("primaryName is not null and birthYear is not null and knownFor is not null") \
   .orderBy('primaryName')
 
 df_actors_distinct.write.mode('overwrite').parquet(S3_PATH+'/JO/actors_distinct.parquet')
 df_actors_distinct = spark.read.parquet(S3_PATH+'/JO/actors_distinct.parquet')
 
+# ----------------------------------------------------------------------------------------------------------------------------
+# Directors
+# ----------------------------------------------------------------------------------------------------------------------------
+
+#matches directors with the movies theyre associated with 
+df_directors_with_movies= df_principals_extended.filter("category like 'dir%'").drop('characters', 'knownforTitles') \
+  .select("nconst", "tconst", "primaryName", "birthYear", "primaryTitle", "startYear", "runtimeMinutes", "genres") \
+  .filter("primaryName is not null and birthYear is not null and primaryTitle is not null") \
+  .orderBy('primaryName').withColumnRenamed('nconst', 'dirconst')
+
+df_directors_with_movies.write.mode('overwrite').parquet(S3_PATH+'/JO/directors_with_movies.parquet')
+df_directors_with_movies = spark.read.parquet(S3_PATH+'/JO/directors_with_movies.parquet')
+
 # finds list of distinct directors for search
 df_directors_distinct = df_principals_extended.filter("category like 'dir%'") \
-  .groupBy(["nconst", "primaryName", "birthYear"]).agg(psf.collect_set('primaryTitle').alias('knownFor'), psf.collect_set('tconst').alias('titlesTconst')) \
+  .groupBy(["nconst", "primaryName", "birthYear"]).agg(psf.collect_set('primaryTitle').alias('knownFor'), psf.collect_set('tconst').alias('titlesTconst')).filter("primaryName is not null and birthYear is not null and knownFor is not null") \
   .orderBy('primaryName').withColumnRenamed('nconst', 'dirconst')
 
 df_directors_distinct.write.mode('overwrite').parquet(S3_PATH+'/JO/directors_distinct.parquet')
 df_directors_distinct = spark.read.parquet(S3_PATH+'/JO/directors_distinct.parquet')
+
+# ----------------------------------------------------------------------------------------------------------------------------
+# Movies
+# ----------------------------------------------------------------------------------------------------------------------------
 
 # each row is a movie with a 1 actor
 df_movies_all = df_imdb_title.filter("lower(titleType) like 'movie' and startYear > 1958") \
@@ -53,23 +87,34 @@ df_movies_distinct = df_movies_all.groupBy(["tconst", "primaryTitle", "startYear
   .agg(psf.collect_set('primaryName').alias('cast'), psf.collect_set('nconst').alias('castNconst')) \
   .groupBy(["tconst", "primaryTitle", "startYear", "runtimeMinutes", "genres", "castNconst", "cast"]) \
   .agg(psf.collect_set('director').alias('director'), psf.collect_set('dirconst').alias('dirconst')) \
-  .orderBy('primaryTitle') 
+  .join(df_imdb_rating.select("averageRating", "tconst"), "tconst", "left") \
+  .filter("tconst is not null and averageRating is not null and director is not null and primaryTitle is not null and runtimeMinutes is not null and startYear is not null") \
+  .orderBy('primaryTitle')
   
 df_movies_distinct.write.mode('overwrite').parquet(S3_PATH+'/JO/movies_distinct.parquet')
 df_movies_distinct = spark.read.parquet(S3_PATH+'/JO/movies_distinct.parquet')
 
+# ----------------------------------------------------------------------------------------------------------------------------
+# Save as csv
+# ----------------------------------------------------------------------------------------------------------------------------
+
+
 # ******** At this point, the files were ready, but the files needed to be uploaded as .csv
 # .csv does not support the array type cols
 # 3 main files
-df_actors_distinct = spark.read.parquet(S3_PATH+'/JO/actors_distinct.parquet')
-df_directors_distinct = spark.read.parquet(S3_PATH+'/JO/directors_distinct.parquet')
-df_movies_distinct = spark.read.parquet(S3_PATH+'/JO/movies_distinct.parquet')
+# df_actors_distinct = spark.read.parquet(S3_PATH+'/JO/actors_distinct.parquet')
+# df_directors_distinct = spark.read.parquet(S3_PATH+'/JO/directors_distinct.parquet')
+# df_movies_distinct = spark.read.parquet(S3_PATH+'/JO/movies_distinct.parquet')
 
 # Convert array columns to string representations
-df_actors_distinct_csv = df_actors_distinct.withColumn("knownFor", psf.expr("concat_ws(',', knownFor)")).withColumn("titlesTconst", psf.expr("concat_ws(',', titlesTconst)"))
-df_directors_distinct_csv = df_directors_distinct.withColumn("knownFor", psf.expr("concat_ws(',', knownFor)")).withColumn("titlesTconst", psf.expr("concat_ws(',', titlesTconst)"))
-df_movies_distinct_dirs_csv = df_movies_distinct_dirs.withColumn("cast", psf.expr("concat_ws(',', cast)")).withColumn("castNconst", psf.expr("concat_ws(',', castNconst)")).withColumn("director", psf.expr("concat_ws(',', cast)")).withColumn("dirconst", psf.expr("concat_ws(',', cast)"))
 
-df_actors_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/actors_distinct_csv.csv', header=True, sep=',')
-df_directors_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/directors_distinct_csv.csv', header=True, sep=',')
-df_movies_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/movies_distinct_csv.csv', header=True, sep=',')
+df_actors_distinct_csv = df_actors_distinct.withColumn("knownFor", psf.expr("concat_ws(',', knownFor)")).withColumn("titlesTconst", psf.expr("concat_ws(',', titlesTconst)"))
+
+df_directors_distinct_csv = df_directors_distinct.withColumn("knownFor", psf.expr("concat_ws(',', knownFor)")).withColumn("titlesTconst", psf.expr("concat_ws(',', titlesTconst)"))
+
+df_movies_distinct_csv = df_movies_distinct.withColumn("cast", psf.expr("concat_ws(',', cast)")).withColumn("castNconst", psf.expr("concat_ws(',', castNconst)")).withColumn("director", psf.expr("concat_ws(',', cast)")).withColumn("dirconst", psf.expr("concat_ws(',', cast)"))
+
+# END RESULT
+df_actors_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/csv/actors_distinct_csv.csv', header=True, sep=',')
+df_directors_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/csv/directors_distinct_csv.csv', header=True, sep=',')
+df_movies_distinct_csv.coalesce(1).write.mode('overwrite').csv(S3_PATH+'/JO/csv/movies_distinct_csv.csv', header=True, sep=',')
